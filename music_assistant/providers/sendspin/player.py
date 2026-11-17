@@ -93,7 +93,11 @@ from music_assistant_models.media_items import Album, Artist, is_track
 from music_assistant_models.player import DeviceInfo
 from PIL import Image
 
-from music_assistant.constants import CONF_ENTRY_FLOW_MODE_SAMPLE_RATE
+from music_assistant.constants import (
+    CONF_ENTRY_FLOW_MODE_SAMPLE_RATE,
+    CONF_PLAYER_PROTOCOLS,
+    CONF_UNDERLYING_PLAYER_ID,
+)
 from music_assistant.controllers.streams.audio_analysis import SMART_FADES_ANALYSIS_DOMAIN
 from music_assistant.helpers.util import is_valid_mac_address
 from music_assistant.models.player import (
@@ -121,6 +125,7 @@ from .constants import (
     CONF_PAIRING_METHOD,
     CONF_PAIRING_PIN,
     CONF_PAIRING_TOKEN,
+    CONF_SENDSPIN_BRIDGE_STATIC_DELAYS,
     CONF_SENDSPIN_STATIC_DELAY,
     CONF_SOURCE_AUTOSTART_TARGET,
     CONF_SOURCE_INPUT_ACTION,
@@ -362,8 +367,6 @@ class SendspinBasePlayer(PlayerProtocol):
     unsub_event_cb: Callable[[], None] | None = None
     unsub_group_event_cb: Callable[[], None] | None = None
     is_web_player: bool = False
-    # set when a device check found the client away, until the client connects again
-    _away_on_check: bool = False
     # transient alert produced by the most recent security action, surfaced on the next
     # config-entries render (the settings page re-renders after invoking an action)
     _pending_security_alert: AlertText | None = None
@@ -449,24 +452,6 @@ class SendspinBasePlayer(PlayerProtocol):
         await super().on_detach()
         self._unsubscribe_client_callbacks()
 
-    async def check_device(self) -> bool | None:
-        """
-        Return whether the client is connected; None for a client that runs in the server.
-
-        A client that is not connected reads unavailable from then on, until it connects again.
-        """
-        if self._connects_when_it_plays:
-            return None
-        away = self.api.connection is None
-        if away != self._away_on_check:
-            self._away_on_check = away
-            self.update_state()
-        return not away
-
-    def on_client_connected(self) -> None:
-        """Handle the client connecting (again): it reads available after a check found it away."""
-        self._away_on_check = False
-
     def ride_on(self, underlying_protocol_id: str) -> None:
         """
         Make this client the bridge of another protocol of its device.
@@ -483,15 +468,6 @@ class SendspinBasePlayer(PlayerProtocol):
         self._attr_private = False
         self._attr_expose_to_ha_by_default = True
         self._attr_session_only = False
-
-    @property
-    def available(self) -> bool:
-        """
-        Return if the player is available.
-
-        Not once a device check found its client away, until the client connects again.
-        """
-        return super().available and not self._away_on_check
 
     @property
     def needs_setup(self) -> bool:
@@ -712,12 +688,6 @@ class SendspinBasePlayer(PlayerProtocol):
     def _is_bridge_or_web_player(self) -> bool:
         """Whether this is a protocol bridge or built-in web/app player (skips pairing setup)."""
         return self.protocol_id.startswith(BRIDGE_PREFIX) or self.is_web_player
-
-    @property
-    def _connects_when_it_plays(self) -> bool:
-        """Whether the client runs in the server, as a bridge or a virtual player does."""
-        provider = cast("SendspinProvider", self.provider)
-        return provider.server_api.is_external_player(self.protocol_id)
 
     @property
     def _offers_unpaired_consent(self) -> bool:
@@ -2264,6 +2234,19 @@ class SendspinPlayer(SendspinBasePlayer):
             self._stop_taking_volume_reports = None
             stop()
 
+    def ride_on(self, underlying_protocol_id: str) -> None:
+        """
+        Make this client the bridge of another protocol of its device.
+
+        A static delay the user set belongs to the protocol that carries the output: once
+        another protocol carries it, the delay set for the protocol before is put aside, and
+        the one set while the new protocol carried it before is back.
+
+        :param underlying_protocol_id: Id of the protocol the bridge rides on.
+        """
+        super().ride_on(underlying_protocol_id)
+        self._hand_static_delay_over(underlying_protocol_id)
+
     async def on_attach(self, player: Player) -> None:
         """Follow the client, from the volume, mute and controls it declares now."""
         await super().on_attach(player)
@@ -2607,6 +2590,30 @@ class SendspinPlayer(SendspinBasePlayer):
             self.config.get_value(CONF_SENDSPIN_STATIC_DELAY, self.static_delay_default_ms),
         )
         player_role.set_output_delay(config_value)
+
+    def _hand_static_delay_over(self, underlying_protocol_id: str) -> None:
+        """
+        Let the stored static delay follow the protocol the output rides on from now on.
+
+        :param underlying_protocol_id: Id of the protocol the output rides on from now on.
+        """
+        if (record := self.mass.config.get_protocol_record(self.protocol_id)) is None:
+            return
+        values = dict(record.get("values") or {})
+        previous_id = values.get(CONF_UNDERLYING_PLAYER_ID)
+        if not isinstance(previous_id, str) or previous_id == underlying_protocol_id:
+            return
+        set_aside = dict(values.pop(CONF_SENDSPIN_BRIDGE_STATIC_DELAYS, None) or {})
+        if (delay := values.pop(CONF_SENDSPIN_STATIC_DELAY, None)) is not None:
+            set_aside[previous_id] = delay
+        if (delay := set_aside.pop(underlying_protocol_id, None)) is not None:
+            values[CONF_SENDSPIN_STATIC_DELAY] = delay
+        if set_aside:
+            values[CONF_SENDSPIN_BRIDGE_STATIC_DELAYS] = set_aside
+        # stored with the delays, so a second hand-over before the attach stores it finds
+        # the delays handed over already
+        values[CONF_UNDERLYING_PLAYER_ID] = underlying_protocol_id
+        self.mass.config.set(f"{CONF_PLAYER_PROTOCOLS}/{self.protocol_id}/values", values)
 
     def _take_reported_volume(self, volume: int, muted: bool) -> None:
         """Take the volume and mute the client reported, and the controls it declares with them."""

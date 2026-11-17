@@ -550,8 +550,6 @@ class SendspinProvider(PlayerProvider):
                 else:
                     self._unencrypted_clients.discard(client_id)
                 self._set_held_elsewhere(client_id, held=False)
-                if isinstance(player := self.get_protocol(client_id), SendspinBasePlayer):
-                    player.on_client_connected()
                 # aiosendspin announces a client once while it keeps it, so a client whose
                 # player was removed meanwhile gets a new one here
                 if client_id in self._announced_clients:

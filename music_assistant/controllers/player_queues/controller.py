@@ -92,6 +92,12 @@ from music_assistant.controllers.players.helpers import is_own_client_player
 from music_assistant.controllers.webserver.helpers.auth_middleware import get_current_user
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.config_entries import PLAYBACK_TARGET_TYPES
+from music_assistant.helpers.one_shot_briefing import (
+    MixLevels,
+    PreparedBriefing,
+    prepare_briefing,
+)
+from music_assistant.helpers.plugin_engines import get_tts_engines
 from music_assistant.helpers.uri import parse_uri
 from music_assistant.models.music_provider import ProviderStreamLimitError
 from music_assistant.models.player import Player, PlayerMedia
@@ -697,6 +703,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         - queue_id: queue_id of the playerqueue to handle the command.
         """
         self._check_player_permission(queue_id)
+        self.mass.streams.audio.briefings.cancel_queue(queue_id)
         await self._handle_stop(queue_id)
 
     @api_command("player_queues/play", required_scope=Scope.QUEUES_CONTROL)
@@ -719,6 +726,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         - queue_id: queue_id of the playerqueue to handle the command.
         """
         self._check_player_permission(queue_id)
+        self.mass.streams.audio.briefings.cancel_queue(queue_id)
         # cancel any pending play_index calls for this queue to prevent conflicts
         self.mass.cancel_timer(f"queue_play_index_{queue_id}")
         self._set_transitioning(queue_id, False)
@@ -962,6 +970,206 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         """Play item at index (or item_id) X in queue."""
         self._check_player_permission(queue_id)
         await self._play_index(queue_id, index, seek_position or None, fade_in)
+
+    @api_command("player_queues/play_index_with_briefing", required_scope=Scope.QUEUES_CONTROL)
+    @handle_play_action
+    async def play_index_with_briefing(
+        self,
+        queue_id: str,
+        queue_item_id: str,
+        run_id: str,
+        message: str,
+        tts_engine: str,
+        language: str | None = None,
+        voice: str | None = None,
+        music_gain: float = 0.25,
+        speech_gain: float = 0.7,
+    ) -> None:
+        """Start an existing queued song with one private, engine-rendered briefing."""
+        self._check_player_permission(queue_id)
+        player = self.mass.players.get_player(queue_id)
+        if player is None:
+            raise PlayerUnavailableError("Briefing player is unavailable")
+        if (
+            player.state.type == PlayerType.GROUP
+            or player.state.active_group
+            or player.state.synced_to
+            or len(player.state.group_members or ()) > 1
+        ):
+            raise InvalidDataError("Briefing prototype only supports a single ungrouped player")
+        item = self.get_item(queue_id, queue_item_id)
+        if item is None or item.media_type != MediaType.TRACK:
+            raise InvalidDataError("Briefing requires an existing queued track")
+        mixer = self.mass.streams.audio.briefings
+        if mixer.has_run(queue_id, run_id):
+            raise InvalidDataError("This briefing run was already attempted")
+        prepared = await prepare_briefing(
+            self.mass,
+            run_id,
+            message,
+            tts_engine,
+            language,
+            voice,
+            levels=MixLevels(music_gain, speech_gain),
+        )
+        try:
+            await self._play_index(queue_id, queue_item_id, 0, False, briefing=prepared)
+        except BaseException:
+            mixer.cancel(queue_id, run_id)
+            raise
+        finally:
+            prepared.source = ""
+
+    @api_command("player_queues/briefing_test_capabilities", required_scope=Scope.QUEUES_CONTROL)
+    @handle_play_action
+    async def briefing_test_capabilities(self, queue_id: str) -> dict[str, Any]:
+        """Read-only readiness and engine identities; never speech or audio locations."""
+        self._check_player_permission(queue_id)
+        queue = self.get(queue_id)
+        player = self.mass.players.get_player(queue_id)
+        if queue is None or player is None:
+            raise PlayerUnavailableError("Test player is unavailable")
+        reasons = []
+        if (
+            player.state.type == PlayerType.GROUP
+            or player.state.active_group
+            or player.state.synced_to
+            or len(player.state.group_members or ()) > 1
+        ):
+            reasons.append("Choose one ungrouped speaker")
+        if queue.state != PlaybackState.IDLE or player.state.playback_state != PlaybackState.IDLE:
+            reasons.append("Stop existing playback before testing")
+        if self._queue_data[queue_id].items:
+            reasons.append("Use an empty development queue; existing queues are not replaced")
+        if queue.repeat_mode != RepeatMode.OFF or queue.autoplay_enabled:
+            reasons.append("Turn off Repeat and Autoplay on the development queue")
+        if queue.overlay_enabled:
+            reasons.append("Turn off the ambient overlay before testing")
+        return {
+            "protocol": 1,
+            "ready": not reasons,
+            "reasons": reasons,
+            "engines": [
+                {"uid": engine.uid, "entity_id": engine.id}
+                for engine in await get_tts_engines(self.mass)
+                if engine.provider.domain == "hass"
+                and str(engine.provider.get_setup_value("url") or "").rstrip("/")
+                == "http://supervisor/core/api"
+            ],
+        }
+
+    @api_command("player_queues/briefing_test_start", required_scope=Scope.QUEUES_CONTROL)
+    @handle_play_action
+    async def briefing_test_start(
+        self,
+        queue_id: str,
+        run_id: str,
+        track_uri: str,
+        message: str,
+        tts_engine: str,
+        language: str,
+        voice: str | None = None,
+        music_gain: float = 0.25,
+        speech_gain: float = 0.7,
+        volume_level: int = 20,
+    ) -> dict[str, Any]:
+        """Explicit development test: only an idle, empty queue and a library track."""
+        self._check_player_permission(queue_id)
+        capability = await self.briefing_test_capabilities(queue_id)
+        if not capability["ready"]:
+            raise InvalidDataError("; ".join(capability["reasons"]))
+        if (
+            not isinstance(track_uri, str)
+            or not track_uri.startswith("library://track/")
+            or not track_uri.removeprefix("library://track/").isdigit()
+        ):
+            raise InvalidDataError("Choose a Music Assistant library track")
+        if type(volume_level) is not int or not 1 <= volume_level <= 40:
+            raise InvalidDataError("Test volume must be between 1 and 40 percent")
+        if tts_engine not in {engine["uid"] for engine in capability["engines"]}:
+            raise InvalidDataError("Select this Home Assistant voice through its MA provider")
+        mixer = self.mass.streams.audio.briefings
+        if mixer.has_run(queue_id, run_id):
+            raise InvalidDataError("This briefing run was already attempted")
+        prepared = await prepare_briefing(
+            self.mass,
+            run_id,
+            message,
+            tts_engine,
+            language,
+            voice,
+            levels=MixLevels(music_gain, speech_gain),
+        )
+        try:
+            await self.play_media(queue_id, track_uri, option=QueueOption.ADD)
+            items = self._queue_data[queue_id].items
+            if len(items) != 1 or items[0].uri != track_uri:
+                raise InvalidDataError("The development queue changed; test not started")
+            player = self.mass.players.get_player(queue_id)
+            if player is None:
+                raise PlayerUnavailableError("Test player became unavailable")
+            owner = {
+                "run_id": run_id,
+                "item_id": items[0].queue_item_id,
+                "music_gain": music_gain,
+                "volume_level": volume_level,
+                "original_volume": player.state.volume_level,
+            }
+            await self._play_index(
+                queue_id, items[0].queue_item_id, 0, False, briefing=prepared, briefing_owner=owner
+            )
+            return {"protocol": 1, "status": "playing"}
+        except BaseException:
+            # Leave ownership for a guarded stop after an uncertain dispatch.
+            mixer.cancel(queue_id, run_id)
+            raise
+        finally:
+            prepared.source = ""
+
+    @api_command("player_queues/briefing_test_control", required_scope=Scope.QUEUES_CONTROL)
+    @handle_play_action
+    async def briefing_test_control(
+        self, queue_id: str, run_id: str, action: str
+    ) -> dict[str, Any]:
+        """Guard every control against a replaced session, source or queue."""
+        self._check_player_permission(queue_id)
+        if action not in ("status", "snooze", "restart", "stop"):
+            raise InvalidDataError("Unknown music-test action")
+        mixer = self.mass.streams.audio.briefings
+        data = self._queue_data[queue_id]
+        owner = mixer.owner(queue_id, run_id, data.session_id)
+        player = self.mass.players.get_player(queue_id)
+        if action == "stop":
+            mixer.reject_run(queue_id, run_id)
+        if (
+            owner is None
+            or player is None
+            or len(data.items) != 1
+            or data.items[0].queue_item_id != owner["item_id"]
+            or player.state.active_source not in (None, queue_id)
+            or player.state.active_group
+            or player.state.synced_to
+            or player.state.type == PlayerType.GROUP
+            or len(player.state.group_members or ()) > 1
+        ):
+            return {"protocol": 1, "owned": False}
+        if action == "restart":
+            if data.queue.state != PlaybackState.IDLE:
+                raise InvalidDataError("Stop this test before restarting its song")
+            await self._play_index(queue_id, owner["item_id"], 0, False, briefing_owner=owner)
+        elif action in ("snooze", "stop"):
+            mixer.cancel_queue(queue_id)
+            await self._handle_stop(queue_id)
+            if action == "snooze":
+                mixer.bind_owner(queue_id, data.session_id, owner)
+            else:
+                # Only restore a level still owned by this test, not a manual change.
+                if player.state.volume_level == owner["volume_level"] and isinstance(
+                    owner["original_volume"], int
+                ):
+                    await self.mass.players.cmd_volume_set(queue_id, owner["original_volume"])
+                self._clear(queue_id, skip_stop=True)
+        return {"protocol": 1, "owned": True, "state": data.queue.state.value}
 
     @api_command("player_queues/transfer", required_scope=Scope.QUEUES_CONTROL)
     async def transfer_queue(  # noqa: PLR0915
@@ -2015,6 +2223,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         index: int | str,
         seek_position: int | None,
         fade_in: bool,
+        *,
+        briefing: PreparedBriefing | None = None,
+        briefing_owner: dict[str, Any] | None = None,
     ) -> None:
         # cancel any pending play_index calls for this queue to prevent conflicts
         self.mass.cancel_timer(f"queue_play_index_{queue_id}")
@@ -2046,7 +2257,24 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 raise PlayerUnavailableError(f"Player {queue_id} is not available")
             queue_data.next_item_id_enqueued = None
             # always update session id when we start a new playback session
+            self.mass.streams.audio.briefings.cancel_queue(queue_id)
             queue_data.session_id = shortuuid.random(length=8)
+            if briefing is not None:
+                if not self.mass.streams.audio.briefings.arm(
+                    queue_id,
+                    queue_data.session_id,
+                    briefing.run_id,
+                    briefing.source,
+                    levels=briefing.levels,
+                    ttl=120,
+                ):
+                    raise InvalidDataError("Briefing run was already attempted")
+            if briefing_owner is not None:
+                self.mass.streams.audio.briefings.bind_owner(
+                    queue_id, queue_data.session_id, briefing_owner
+                )
+                if briefing is not None:
+                    await self.mass.players.cmd_volume_set(queue_id, briefing_owner["volume_level"])
             self.mass.streams.audio_processing.start_session(
                 queue_id,
                 queue_data.session_id,

@@ -957,6 +957,7 @@ class StreamsController(CoreController):
                 # radio plays as a single long-lived stream (never in flow mode),
                 # so mix the audio overlay in here
                 audio_input = self.audio.get_overlay_mixed_stream(queue, audio_input, pcm_format)
+            audio_input = self.audio.briefings.wrap(queue_id, session_id, audio_input, pcm_format)
             # stream the audio
             # this final ffmpeg process in the chain converts raw lossless PCM into
             # the desired output format for the player including any player specific
@@ -1368,6 +1369,7 @@ class StreamsController(CoreController):
         )
         if overlay_active(queue):
             flow_stream = self.audio.get_overlay_mixed_stream(queue, flow_stream, flow_pcm_format)
+        flow_stream = self.audio.briefings.wrap(queue_id, session_id, flow_stream, flow_pcm_format)
         audio_bytes = get_ffmpeg_stream(
             audio_input=flow_stream,
             input_format=flow_pcm_format,
@@ -1655,6 +1657,9 @@ class StreamsController(CoreController):
                     flow_stream = self.audio.get_overlay_mixed_stream(
                         queue, flow_stream, pcm_format
                     )
+                flow_stream = self.audio.briefings.wrap(
+                    queue.queue_id, queue_session_id, flow_stream, pcm_format
+                )
                 return self._count_as_output_stream(flow_stream)
             # single item stream (e.g. radio or non-flow mode)
             queue_item = self.mass.player_queues.get_item(media.source_id, media.queue_item_id)
@@ -1687,6 +1692,10 @@ class StreamsController(CoreController):
             ):
                 # radio plays as a single long-lived stream, so mix the overlay in here
                 inner_stream = self.audio.get_overlay_mixed_stream(queue, inner_stream, pcm_format)
+            if queue is not None:
+                inner_stream = self.audio.briefings.wrap(
+                    queue.queue_id, queue_session_id, inner_stream, pcm_format
+                )
             # mirror the on_source_selected/unselected lifecycle the HTTP route
             # fires, so direct-PCM consumers (AirPlay, Snapcast, UGP) honour the
             # plugin contract too

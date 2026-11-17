@@ -147,6 +147,7 @@ from music_assistant.helpers.ffmpeg import (
     get_ffmpeg_stream,
 )
 from music_assistant.helpers.named_pipe import read_named_pipe
+from music_assistant.helpers.one_shot_briefing import OneShotMixer
 from music_assistant.helpers.playlists import (
     HLS_CONTENT_TYPES,
     PLAYLIST_CONTENT_TYPES,
@@ -567,6 +568,7 @@ class StreamsAudio:
         :param mass: The MusicAssistant instance.
         """
         self.mass = mass
+        self.briefings = OneShotMixer()
         self.logger = logging.getLogger(f"{MASS_LOGGER_NAME}.streams.audio")
         self._crossfade_handover: dict[str, CrossfadeHandover] = {}
         # queue_id -> (item the fade is being built for, set once its data is stored).

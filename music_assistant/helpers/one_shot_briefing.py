@@ -94,6 +94,7 @@ class MixLevels:
 
     music: float = 0.25
     speech: float = 0.7
+    delay_seconds: int = 0
 
     def validate(self) -> None:
         """Reject invalid gains and preserve mix headroom."""
@@ -102,6 +103,8 @@ class MixLevels:
                 raise ValueError("Mix gains must be finite values between zero and one")
         if self.music + self.speech > 1:
             raise ValueError("Leave headroom: combined gains must not exceed one")
+        if type(self.delay_seconds) is not int or not 0 <= self.delay_seconds <= 120:
+            raise ValueError("Speech delay must be between zero and 120 seconds")
 
 
 DEFAULT_LEVELS = MixLevels()
@@ -168,7 +171,8 @@ def native_mix(
         input_args=args,
         filters=(
             f"atrim=duration=240,volume={levels.speech},"
-            f"aresample={pcm_format.sample_rate},aformat=channel_layouts={layout}"
+            f"aresample={pcm_format.sample_rate},aformat=channel_layouts={layout},"
+            f"adelay=delays={levels.delay_seconds * 1000}:all=1"
         ),
     )
     graph = ComplexFilter(
@@ -208,7 +212,7 @@ class OneShotMixer:
             [AsyncGenerator[bytes], str, AudioFormat, MixLevels], AsyncGenerator[bytes]
         ] = native_mix,
         clock: Callable[[], float] = monotonic,
-        max_runs: int = 256,
+        max_runs: int = 65536,
     ) -> None:
         """Initialize bounded runtime state with an injectable audio engine."""
         self.engine = engine
@@ -272,6 +276,16 @@ class OneShotMixer:
         _identifier(run_id)
         if len(self._seen) < self.max_runs:
             self._seen.add((queue_id, run_id))
+
+    def claim_music_run(self, queue_id: str, run_id: str) -> None:
+        """Consume a music-only start id with the same fail-closed replay bound."""
+        _identifier(queue_id)
+        _identifier(run_id)
+        if (queue_id, run_id) in self._seen:
+            raise ValueError("This alarm start was already attempted")
+        if len(self._seen) >= self.max_runs:
+            raise ValueError("Alarm run limit reached; replay protection was retained")
+        self._seen.add((queue_id, run_id))
 
     def cancel(self, queue_id: str, run_id: str) -> None:
         """Cancel only this run; do not cancel another alarm that owns the queue."""

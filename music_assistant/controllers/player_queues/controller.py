@@ -1171,6 +1171,99 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 self._clear(queue_id, skip_stop=True)
         return {"protocol": 1, "owned": True, "state": data.queue.state.value}
 
+    @api_command("player_queues/alarm_capabilities", required_scope=Scope.QUEUES_CONTROL)
+    @handle_play_action
+    async def alarm_capabilities(self, queue_id: str) -> dict[str, Any]:
+        """Versioned scheduled-alarm contract; legacy test APIs are not sufficient."""
+        result = await self.briefing_test_capabilities(queue_id)
+        return {
+            **result,
+            "protocol": 2,
+            "features": ["selected_track", "speech_delay", "music_only"],
+        }
+
+    @api_command("player_queues/alarm_start", required_scope=Scope.QUEUES_CONTROL)
+    @handle_play_action
+    async def alarm_start(
+        self,
+        queue_id: str,
+        run_id: str,
+        track_uri: str,
+        message: str = "",
+        tts_engine: str = "",
+        language: str | None = None,
+        voice: str | None = None,
+        music_gain: float = 0.25,
+        speech_delay: int = 0,
+        volume_level: int = 20,
+    ) -> dict[str, Any]:
+        """Start a selected library song, optionally with one finite delayed briefing."""
+        self._check_player_permission(queue_id)
+        capability = await self.alarm_capabilities(queue_id)
+        if not capability["ready"]:
+            raise InvalidDataError("; ".join(capability["reasons"]))
+        if (
+            not isinstance(track_uri, str)
+            or not track_uri.startswith("library://track/")
+            or not track_uri.removeprefix("library://track/").isascii()
+            or not track_uri.removeprefix("library://track/").isdigit()
+        ):
+            raise InvalidDataError("Choose a Music Assistant library track")
+        if type(volume_level) is not int or not 1 <= volume_level <= 100:
+            raise InvalidDataError("Alarm volume must be between 1 and 100 percent")
+        levels = MixLevels(music_gain, 0.7, speech_delay)
+        levels.validate()
+        if not 0 < music_gain <= 0.3:
+            raise InvalidDataError("Music gain must be above zero and at most 30 percent")
+        if not isinstance(message, str) or len(message) > 4096:
+            raise InvalidDataError("Invalid alarm message")
+        if message and tts_engine not in {engine["uid"] for engine in capability["engines"]}:
+            raise InvalidDataError("Select this Home Assistant voice through its MA provider")
+        mixer = self.mass.streams.audio.briefings
+        if mixer.has_run(queue_id, run_id):
+            raise InvalidDataError("This alarm start was already attempted")
+        prepared = None
+        if message:
+            prepared = await prepare_briefing(
+                self.mass, run_id, message, tts_engine, language, voice, levels=levels
+            )
+        try:
+            await self.play_media(queue_id, track_uri, option=QueueOption.ADD)
+            items = self._queue_data[queue_id].items
+            if len(items) != 1 or items[0].uri != track_uri:
+                raise InvalidDataError("The queue changed; alarm not started")
+            player = self.mass.players.get_player(queue_id)
+            if player is None:
+                raise PlayerUnavailableError("Alarm player became unavailable")
+            owner = {
+                "run_id": run_id,
+                "item_id": items[0].queue_item_id,
+                "music_gain": music_gain,
+                "volume_level": volume_level,
+                "original_volume": player.state.volume_level,
+            }
+            # Music-only starts also consume their id before dispatch. Failed or
+            # uncertain starts must never be blindly submitted a second time.
+            if prepared is None:
+                mixer.claim_music_run(queue_id, run_id)
+            await self._play_index(
+                queue_id, items[0].queue_item_id, 0, False, briefing=prepared, briefing_owner=owner
+            )
+            return {"protocol": 2, "status": "playing"}
+        except BaseException:
+            mixer.cancel(queue_id, run_id)
+            raise
+        finally:
+            if prepared is not None:
+                prepared.source = ""
+
+    @api_command("player_queues/alarm_control", required_scope=Scope.QUEUES_CONTROL)
+    @handle_play_action
+    async def alarm_control(self, queue_id: str, run_id: str, action: str) -> dict[str, Any]:
+        """Keep exact queue/session ownership checks shared with the tested controls."""
+        result = await self.briefing_test_control(queue_id, run_id, action)
+        return {**result, "protocol": 2}
+
     @api_command("player_queues/transfer", required_scope=Scope.QUEUES_CONTROL)
     async def transfer_queue(  # noqa: PLR0915
         self,
@@ -2273,8 +2366,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                 self.mass.streams.audio.briefings.bind_owner(
                     queue_id, queue_data.session_id, briefing_owner
                 )
-                if briefing is not None:
-                    await self.mass.players.cmd_volume_set(queue_id, briefing_owner["volume_level"])
+                await self.mass.players.cmd_volume_set(queue_id, briefing_owner["volume_level"])
             self.mass.streams.audio_processing.start_session(
                 queue_id,
                 queue_data.session_id,

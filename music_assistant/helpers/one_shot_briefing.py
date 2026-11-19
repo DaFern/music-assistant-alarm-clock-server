@@ -221,7 +221,17 @@ class OneShotMixer:
         self._pending: dict[str, Briefing] = {}
         self._active: dict[str, Briefing] = {}
         self._seen: set[tuple[str, str]] = set()
+        self._alarm_starts: set[tuple[str, str]] = set()
         self._owners: dict[str, dict[str, Any]] = {}
+
+    def reserve_alarm_start(self, queue_id: str, run_id: str) -> None:
+        """Tombstone enqueue attempts independently of the one-shot speech claim."""
+        _identifier(queue_id)
+        _identifier(run_id)
+        key = (queue_id, run_id)
+        if key in self._alarm_starts or len(self._alarm_starts) >= self.max_runs:
+            raise ValueError("This alarm start was already attempted or the run limit was reached")
+        self._alarm_starts.add(key)
 
     def bind_owner(self, queue_id: str, session_id: str | None, owner: dict[str, Any]) -> None:
         """Retain private test ownership after the finite speech stream finishes."""

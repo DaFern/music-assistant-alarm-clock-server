@@ -1022,7 +1022,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
 
     @api_command("player_queues/briefing_test_capabilities", required_scope=Scope.QUEUES_CONTROL)
     @handle_play_action
-    async def briefing_test_capabilities(self, queue_id: str) -> dict[str, Any]:
+    async def briefing_test_capabilities(
+        self, queue_id: str, preserve_queue: bool = False
+    ) -> dict[str, Any]:
         """Read-only readiness and engine identities; never speech or audio locations."""
         self._check_player_permission(queue_id)
         queue = self.get(queue_id)
@@ -1037,9 +1039,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             or len(player.state.group_members or ()) > 1
         ):
             reasons.append("Choose one ungrouped speaker")
-        if queue.state != PlaybackState.IDLE or player.state.playback_state != PlaybackState.IDLE:
+        if not preserve_queue and (
+            queue.state != PlaybackState.IDLE or player.state.playback_state != PlaybackState.IDLE
+        ):
             reasons.append("Stop existing playback before testing")
-        if self._queue_data[queue_id].items:
+        if not preserve_queue and self._queue_data[queue_id].items:
             reasons.append("Use an empty development queue; existing queues are not replaced")
         if queue.repeat_mode != RepeatMode.OFF or queue.autoplay_enabled:
             reasons.append("Turn off Repeat and Autoplay on the development queue")
@@ -1141,11 +1145,28 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         player = self.mass.players.get_player(queue_id)
         if action == "stop":
             mixer.reject_run(queue_id, run_id)
+        preserve = owner is not None and owner.get("preserve_queue", False)
+        item_ids = [item.queue_item_id for item in data.items] if preserve else []
         if (
             owner is None
             or player is None
-            or len(data.items) != 1
-            or data.items[0].queue_item_id != owner["item_id"]
+            or (
+                preserve
+                and (
+                    owner["item_id"] not in item_ids
+                    or (
+                        data.queue.state != PlaybackState.IDLE
+                        and (
+                            data.queue.current_item is None
+                            or data.queue.current_item.queue_item_id != owner["item_id"]
+                        )
+                    )
+                )
+            )
+            or (
+                not preserve
+                and (len(data.items) != 1 or data.items[0].queue_item_id != owner["item_id"])
+            )
             or player.state.active_source not in (None, queue_id)
             or player.state.active_group
             or player.state.synced_to
@@ -1168,18 +1189,34 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
                     owner["original_volume"], int
                 ):
                     await self.mass.players.cmd_volume_set(queue_id, owner["original_volume"])
-                self._clear(queue_id, skip_stop=True)
+                if preserve:
+                    # Never clear the user's queue. Remove only this run's unique item,
+                    # after a confirmed stop and while still holding the queue lock.
+                    data.queue.current_index = None
+                    data.queue.index_in_buffer = None
+                    self.update_items(
+                        queue_id,
+                        [item for item in data.items if item.queue_item_id != owner["item_id"]],
+                    )
+                else:
+                    self._clear(queue_id, skip_stop=True)
         return {"protocol": 1, "owned": True, "state": data.queue.state.value}
 
     @api_command("player_queues/alarm_capabilities", required_scope=Scope.QUEUES_CONTROL)
     @handle_play_action
     async def alarm_capabilities(self, queue_id: str) -> dict[str, Any]:
         """Versioned scheduled-alarm contract; legacy test APIs are not sufficient."""
-        result = await self.briefing_test_capabilities(queue_id)
+        result = await self.briefing_test_capabilities(queue_id, preserve_queue=True)
         return {
             **result,
             "protocol": 2,
-            "features": ["selected_track", "speech_delay", "music_only"],
+            "features": [
+                "selected_track",
+                "speech_delay",
+                "music_only",
+                "volume_ramp",
+                "preserve_queue",
+            ],
         }
 
     @api_command("player_queues/alarm_start", required_scope=Scope.QUEUES_CONTROL)
@@ -1222,22 +1259,36 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         mixer = self.mass.streams.audio.briefings
         if mixer.has_run(queue_id, run_id):
             raise InvalidDataError("This alarm start was already attempted")
+        # Reserve before preparation/enqueue, including failures and lost responses.
+        mixer.reserve_alarm_start(queue_id, run_id)
         prepared = None
         if message:
             prepared = await prepare_briefing(
                 self.mass, run_id, message, tts_engine, language, voice, levels=levels
             )
         try:
+            before = list(self._queue_data[queue_id].items)
+            before_ids = {item.queue_item_id for item in before}
             await self.play_media(queue_id, track_uri, option=QueueOption.ADD)
             items = self._queue_data[queue_id].items
-            if len(items) != 1 or items[0].uri != track_uri:
+            added = [item for item in items if item.queue_item_id not in before_ids]
+            if (
+                len(added) != 1
+                or added[0].uri != track_uri
+                or not before_ids <= {item.queue_item_id for item in items}
+            ):
                 raise InvalidDataError("The queue changed; alarm not started")
+            # ADD can shuffle the tail. Restore all existing tracks' original order
+            # and append our unique item before selecting it explicitly.
+            item = added[0]
+            self.update_items(queue_id, [*before, item])
             player = self.mass.players.get_player(queue_id)
             if player is None:
                 raise PlayerUnavailableError("Alarm player became unavailable")
             owner = {
                 "run_id": run_id,
-                "item_id": items[0].queue_item_id,
+                "item_id": item.queue_item_id,
+                "preserve_queue": True,
                 "music_gain": music_gain,
                 "volume_level": volume_level,
                 "original_volume": player.state.volume_level,
@@ -1247,7 +1298,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             if prepared is None:
                 mixer.claim_music_run(queue_id, run_id)
             await self._play_index(
-                queue_id, items[0].queue_item_id, 0, False, briefing=prepared, briefing_owner=owner
+                queue_id, item.queue_item_id, 0, False, briefing=prepared, briefing_owner=owner
             )
             return {"protocol": 2, "status": "playing"}
         except BaseException:
@@ -1259,10 +1310,86 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
 
     @api_command("player_queues/alarm_control", required_scope=Scope.QUEUES_CONTROL)
     @handle_play_action
-    async def alarm_control(self, queue_id: str, run_id: str, action: str) -> dict[str, Any]:
+    async def alarm_control(
+        self,
+        queue_id: str,
+        run_id: str,
+        action: str,
+        volume_level: int | None = None,
+    ) -> dict[str, Any]:
         """Keep exact queue/session ownership checks shared with the tested controls."""
+        if volume_level is not None:
+            if action != "restart" or type(volume_level) is not int or not 1 <= volume_level <= 100:
+                raise InvalidDataError("Only a stopped alarm restart can reset volume (1-100)")
+        if action == "restart":
+            status = await self.briefing_test_control(queue_id, run_id, "status")
+            if not status["owned"]:
+                return {**status, "protocol": 2}
+            if status["state"] != PlaybackState.IDLE.value:
+                raise InvalidDataError("Stop the alarm before resetting its ring volume")
+            mixer = self.mass.streams.audio.briefings
+            data = self._queue_data[queue_id]
+            owner = mixer.owner(queue_id, run_id, data.session_id)
+            assert owner is not None
+            if volume_level is not None:
+                owner.update(volume_level=volume_level, ramp_suspended=False)
+            elif owner.get("ramp_checked"):
+                player = self.mass.players.get_player(queue_id)
+                assert player is not None
+                actual = player.state.volume_level
+                if type(actual) is not int or not 0 <= actual <= 100:
+                    raise InvalidDataError("Check the speaker volume before restarting its song")
+                if actual != owner["volume_level"]:
+                    owner.update(volume_level=actual, ramp_suspended=True, original_volume=None)
+            mixer.bind_owner(queue_id, data.session_id, owner)
         result = await self.briefing_test_control(queue_id, run_id, action)
         return {**result, "protocol": 2}
+
+    @api_command("player_queues/alarm_volume", required_scope=Scope.QUEUES_CONTROL)
+    @handle_play_action
+    async def alarm_volume(
+        self,
+        queue_id: str,
+        run_id: str,
+        volume_level: int | None = None,
+    ) -> dict[str, Any]:
+        """Check ownership and manual changes under the queue lock, without replaying media."""
+        self._check_player_permission(queue_id)
+        if volume_level is not None and (
+            type(volume_level) is not int or not 1 <= volume_level <= 100
+        ):
+            raise InvalidDataError("Alarm volume must be between 1 and 100 percent")
+        status = await self.briefing_test_control(queue_id, run_id, "status")
+        if not status["owned"]:
+            return {**status, "protocol": 2}
+        mixer = self.mass.streams.audio.briefings
+        data = self._queue_data[queue_id]
+        owner = mixer.owner(queue_id, run_id, data.session_id)
+        player = self.mass.players.get_player(queue_id)
+        assert owner is not None
+        assert player is not None
+        owner["ramp_checked"] = True
+        mixer.bind_owner(queue_id, data.session_id, owner)
+        actual = player.state.volume_level
+        if type(actual) is not int or not 0 <= actual <= 100 or actual != owner["volume_level"]:
+            # A manual change owns the level now, including at the next song loop.
+            # Never restore the old pre-alarm level over that manual choice.
+            owner.update(ramp_suspended=True, original_volume=None)
+            if type(actual) is int and 0 <= actual <= 100:
+                owner["volume_level"] = actual
+            mixer.bind_owner(queue_id, data.session_id, owner)
+        suspended = bool(owner.get("ramp_suspended"))
+        if (
+            volume_level is not None
+            and not suspended
+            and status["state"] == PlaybackState.PLAYING.value
+        ):
+            owner["volume_level"] = volume_level
+            # Record intent before dispatch: an uncertain response is never retried.
+            mixer.bind_owner(queue_id, data.session_id, owner)
+            await self.mass.players.cmd_volume_set(queue_id, volume_level)
+            actual = volume_level
+        return {**status, "protocol": 2, "volume_level": actual, "suspended": suspended}
 
     @api_command("player_queues/transfer", required_scope=Scope.QUEUES_CONTROL)
     async def transfer_queue(  # noqa: PLR0915

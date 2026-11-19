@@ -222,6 +222,8 @@ class OneShotMixer:
         self._active: dict[str, Briefing] = {}
         self._seen: set[tuple[str, str]] = set()
         self._alarm_starts: set[tuple[str, str]] = set()
+        self.alarm_releases: dict[tuple[str, str], dict[str, Any]] = {}
+        self.alarm_segments: dict[tuple[str, str], dict[str, Any]] = {}
         self._owners: dict[str, dict[str, Any]] = {}
 
     def reserve_alarm_start(self, queue_id: str, run_id: str) -> None:
